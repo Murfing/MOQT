@@ -7,117 +7,96 @@ namespace rvn
 {
 
 /**
- * @brief Template class for handling various types of messages in a QUIC-based Media over QUIC Transport (MOQT) system.
- * 
- * This class serves as a central message processing hub that handles different types of protocol messages
- * such as client setup, server setup, subscriptions, and data streams. It uses template metaprogramming
- * to support flexibility in the underlying MOQT implementation.
+ * @brief MessageHandler class handles different types of MOQT (Media Over QUIC Transport) protocol messages
+ * @tparam MOQTObject The type of MOQT object this handler will work with
  *
- * @tparam MOQTObject The core object type that implements the MOQT protocol operations
+ * This class implements the message handling logic for the MOQT protocol, managing
+ * the communication between publishers and subscribers in a QUIC-based media transport system.
  */
-template <typename MOQTObject> 
-class MessageHandler
+template <typename MOQTObject> class MessageHandler
 {
-    MOQTObject& moqt;                // Reference to the core MOQT object containing protocol implementation
-    ConnectionState& connectionState; // Manages the current state of the QUIC connection
+    MOQTObject& moqt;                  // Reference to the main MOQT object
+    ConnectionState& connectionState;   // Reference to the current connection state
 
     /**
-     * @brief Processes a ClientSetupMessage received from a connecting client
-     * 
-     * This handler performs version negotiation between client and server:
-     * 1. Checks if the client supports the server's protocol version
-     * 2. Extracts connection parameters like path and role
-     * 3. Responds with a ServerSetupMessage containing server configuration
-     * 
-     * @param connectionState Current connection state object
-     * @param clientSetupMessage The received setup message from client
-     * @return QUIC_STATUS Success or failure status code
+     * @brief Handles the initial setup message from a client
+     * @param connectionState Current connection state
+     * @param clientSetupMessage The setup message received from the client
+     * @return QUIC_STATUS indicating success or failure
+     *
+     * Process:
+     * 1. Verifies version compatibility between client and server
+     * 2. Extracts connection parameters (path, peer role)
+     * 3. Responds with a SERVER_SETUP message
      */
-    QUIC_STATUS handle_message(ConnectionState&, protobuf_messages::ClientSetupMessage&& clientSetupMessage)
+    QUIC_STATUS
+    handle_message(ConnectionState&, protobuf_messages::ClientSetupMessage&& clientSetupMessage)
     {
-        // Get list of protocol versions the client supports
+        // Check if the client supports our version
         auto& supportedversions = clientSetupMessage.supportedversions();
-
-        // Check if client supports our protocol version
         auto matchingVersionIter =
             std::find(supportedversions.begin(), supportedversions.end(), moqt.version);
 
-        // If no matching version found, we can't communicate with this client
+        // If no matching version is found, reject the connection
         if (matchingVersionIter == supportedversions.end())
         {
-            // Future: Implement proper connection termination
-            // connectionState.destroy_connection();
+            // TODO: Implement connection destruction
             return QUIC_STATUS_INVALID_PARAMETER;
         }
 
-        // Get index of matching version in client's supported versions list
+        // Get the index of the matching version to find corresponding parameters
         std::size_t iterIdx = std::distance(supportedversions.begin(), matchingVersionIter);
-
-        // Extract connection parameters for the matching version
         auto& params = clientSetupMessage.parameters()[iterIdx];
-
-        // Set up connection path based on client parameters
+        
+        // Store connection parameters
         connectionState.path = std::move(params.path().path());
-
-        // Store the role (Publisher/Subscriber) that the client wants to assume
         connectionState.peerRole = params.role().role();
 
-        // Log the setup message for debugging
         utils::LOG_EVENT(std::cout, "Client Setup Message received: \n",
-                         clientSetupMessage.DebugString());
+                        clientSetupMessage.DebugString());
 
-        // Prepare server's response message
+        // Prepare and send SERVER_SETUP response
         protobuf_messages::MessageHeader serverSetupHeader;
         serverSetupHeader.set_messagetype(protobuf_messages::MoQtMessageType::SERVER_SETUP);
 
-        // Create and configure server setup message
         protobuf_messages::ServerSetupMessage serverSetupMessage;
         serverSetupMessage.add_parameters()->mutable_role()->set_role(
             protobuf_messages::Role::Publisher);
 
-        // Serialize the response into a QUIC buffer
+        // Serialize and queue the response
         QUIC_BUFFER* quicBuffer =
             serialization::serialize(serverSetupHeader, serverSetupMessage);
-
-        // Reset control stream shutdown flag
         connectionState.expectControlStreamShutdown = false;
 
-        // Queue the response to be sent
         connectionState.enqueue_control_buffer(quicBuffer);
 
         return QUIC_STATUS_SUCCESS;
     }
 
     /**
-     * @brief Processes a ServerSetupMessage received from a server
-     * 
-     * Validates and processes the server's setup parameters:
-     * 1. Ensures server isn't using path parameter (which is client-only)
-     * 2. Verifies required parameters are present
-     * 3. Sets up connection state based on server's role
-     * 
-     * @param connectionState Current connection state object
-     * @param serverSetupMessage The received setup message from server
-     * @return QUIC_STATUS Success or failure status code
+     * @brief Handles the setup message from a server
+     * @param connectionState Current connection state
+     * @param serverSetupMessage The setup message received from the server
+     * @return QUIC_STATUS indicating success or failure
+     *
+     * Validates and processes the server's setup parameters, ensuring they meet protocol requirements
      */
-    QUIC_STATUS handle_message(ConnectionState&, protobuf_messages::ServerSetupMessage&& serverSetupMessage)
+    QUIC_STATUS
+    handle_message(ConnectionState&, protobuf_messages::ServerSetupMessage&& serverSetupMessage)
     {
-        // Server must not specify a path (that's client-only)
+        // Verify server doesn't use path parameter (protocol requirement)
         utils::ASSERT_LOG_THROW(connectionState.path.size() == 0,
-                                "Server must not use the path parameter");
-
-        // Server must provide at least role parameter
+                               "Server must not use the path parameter");
+        
+        // Ensure server provided at least role parameter
         utils::ASSERT_LOG_THROW(serverSetupMessage.parameters().size() > 0,
-                                "SERVER_SETUP sent no parameters, requires at least role parameter");
+                               "SERVER_SETUP sent no parameters, requires at least role parameter");
 
-        // Log received message
         utils::LOG_EVENT(std::cout, "Server Setup Message received: ",
-                         serverSetupMessage.DebugString());
+                        serverSetupMessage.DebugString());
 
-        // Store server's declared role
+        // Store server's role and mark control stream for shutdown
         connectionState.peerRole = serverSetupMessage.parameters()[0].role().role();
-
-        // Mark that we expect the control stream to close
         connectionState.expectControlStreamShutdown = true;
 
         return QUIC_STATUS_SUCCESS;
@@ -125,22 +104,24 @@ class MessageHandler
 
     /**
      * @brief Handles subscription requests from clients
-     * 
-     * Processes a client's request to subscribe to specific data streams:
-     * 1. Logs the subscription request
-     * 2. Attempts to register the subscription with the MOQT core
-     * 
-     * @param connectionState Current connection state object
+     * @param connectionState Current connection state
      * @param subscribeMessage The subscription request message
-     * @return QUIC_STATUS Success or failure status code
+     * @return QUIC_STATUS indicating success or failure
+     *
+     * Processes subscription requests for media content. Currently contains commented-out
+     * validation logic that would verify proper message format and parameters.
      */
     QUIC_STATUS handle_message(ConnectionState&, protobuf_messages::SubscribeMessage&& subscribeMessage)
     {
-        // Log subscription request
-        utils::LOG_EVENT(std::cout, "Subscribe Message received: \n",
-                         subscribeMessage.DebugString());
+        // NOTE: Commented out validation checks would verify:
+        // - Client is subscribing to a Publisher
+        // - Proper inclusion of start/end group/object IDs based on filter type
+        // - Correct parameter combinations for different filter types
 
-        // Attempt to register subscription with MOQT core
+        utils::LOG_EVENT(std::cout, "Subscribe Message received: \n",
+                        subscribeMessage.DebugString());
+
+        // Register the subscription with the MOQT object
         auto err =
             moqt.try_register_subscription(connectionState, std::move(subscribeMessage));
 
@@ -148,23 +129,18 @@ class MessageHandler
     }
 
     /**
-     * @brief Processes incoming data stream messages
-     * 
-     * Handles messages containing actual data payloads:
-     * 1. Extracts the subscription ID
-     * 2. Queues the payload for processing
-     * 
-     * @param connectionState Current connection state object
-     * @param objectStreamMessage Message containing the data payload
-     * @return QUIC_STATUS Success or failure status code
+     * @brief Handles incoming media object stream messages
+     * @param connectionState Current connection state
+     * @param objectStreamMessage The message containing media object data
+     * @return QUIC_STATUS indicating success or failure
+     *
+     * Processes incoming media object data and adds it to the appropriate queue
      */
-    QUIC_STATUS handle_message(ConnectionState& connectionState,
-                               protobuf_messages::ObjectStreamMessage&& objectStreamMessage)
+    QUIC_STATUS
+    handle_message(ConnectionState& connectionState,
+                  protobuf_messages::ObjectStreamMessage&& objectStreamMessage)
     {
-        // Get subscription ID this data belongs to
         std::uint64_t subscribeId = objectStreamMessage.subscribeid();
-
-        // Queue payload for processing
         connectionState.add_to_queue(objectStreamMessage.objectpayload());
 
         return QUIC_STATUS_SUCCESS;
@@ -172,9 +148,8 @@ class MessageHandler
 
 public:
     /**
-     * @brief Constructs a new MessageHandler instance
-     * 
-     * @param moqt Reference to the MOQT core object
+     * @brief Constructor for MessageHandler
+     * @param moqt Reference to the MOQT object
      * @param connectionState Reference to the connection state
      */
     MessageHandler(MOQTObject& moqt, ConnectionState& connectionState)
@@ -183,25 +158,18 @@ public:
     }
 
     /**
-     * @brief Generic entry point for processing any type of message
-     * 
-     * Template function that:
-     * 1. Deserializes incoming message stream
-     * 2. Routes to appropriate handler based on message type
-     * 
-     * @tparam MessageType The type of message to be processed
+     * @brief Generic message handler that deserializes and processes incoming messages
+     * @tparam MessageType The type of message to be handled
      * @param connectionState Current connection state
      * @param istream Input stream containing the serialized message
-     * @return QUIC_STATUS Success or failure status code
+     * @return QUIC_STATUS indicating success or failure
      */
     template <typename MessageType>
     QUIC_STATUS handle_message(ConnectionState& connectionState,
-                               google::protobuf::io::IstreamInputStream& istream)
+                             google::protobuf::io::IstreamInputStream& istream)
     {
-        // Deserialize the message from the input stream
+        // Deserialize the message and forward to appropriate handler
         MessageType message = serialization::deserialize<MessageType>(istream);
-
-        // Route to appropriate handler based on message type
         return handle_message(connectionState, std::move(message));
     }
 };
